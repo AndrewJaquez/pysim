@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysim-traffic"
+version = "0.1.0"
+description = "Python-based microscopic traffic simulation"
+authors = [{name = "PySimTraffic Dev"}]
+dependencies = [
+    "numpy>=1.21.0",
+    "pydantic>=2.0.0",
+    "orjson>=3.0.0",
+    "pygame>=2.1.0",
+]
+
+[project.optional-dependencies]
+speed = ["numba>=0.56.0"]
+charts = ["matplotlib>=3.5.0"]
+dev = ["pytest>=7.0.0", "black", "isort"]
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.isort]
+profile = "black"
+line_length = 88

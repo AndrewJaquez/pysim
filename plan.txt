@@ -1,0 +1,339 @@
+Sweet—here’s a clean, implementation-ready spec for a **Python-only** traffic sim. It’s built as a deterministic core library with a lightweight Python UI (pygame) and a fully headless batch mode for fast runs.
+
+---
+
+# Project: `pysim-traffic`
+
+## 0) Tech stack
+
+* **Python**: 3.11+
+* **Core deps**: `numpy` (required), `numba` (optional speed-ups), `pydantic` (config/schema), `orjson` (save/load), `pygame` (UI), `matplotlib` (optional charts)
+* **No Unity.** Everything runs with `python main.py` (UI) or `python run_scenario.py` (headless).
+
+Repo layout:
+
+```
+pysim_traffic/
+  core/
+    __init__.py
+    geometry.py         # nodes/links/lanes, lane connections
+    control.py          # signals, stop/yield logic
+    demand.py           # spawners/sinks & OD selection
+    routing.py          # shortest paths & dynamic costs
+    dynamics.py         # IDM (car-following), MOBIL (lane change)
+    scheduler.py        # fixed-timestep loop
+    state.py            # SoA vehicle store, RNG, determinism
+    metrics.py          # throughput, delay, queues, V/C, histograms
+    persist.py          # save/load JSONL (orjson)
+  ui/
+    pygame_app.py       # draw, input, overlays, editors
+    brushes.py          # road draw, lane tool, signal tool
+    panels.py           # demand editor, link inspector
+  scenarios/
+    grid_4way.json
+    freeway_merge.json
+  scripts/
+    run_scenario.py     # headless batch, CSV output
+    record_replay.py    # deterministic playback
+  tests/
+    test_idm.py test_mobil.py test_routing.py test_signals.py
+  main.py               # launches pygame UI
+  pyproject.toml
+  README.md
+```
+
+---
+
+## 1) Goals & scope
+
+* **Road builder**: Draw roads, intersections, lane counts, speed limits, one-way toggles, turn lanes, signals/stop/yield.
+* **Demand control**: Per-entry **cars/hour** & **trucks/hour**, time windows, optional OD distributions.
+* **Microsimulation**: Car-following (IDM), lane-changes (MOBIL-lite), intersection control, routing with dynamic costs.
+* **Deterministic**: Fixed time-step, seeded RNG, stable iteration order.
+* **Two modes**:
+
+  * **UI** (pygame 2D),
+  * **Headless** (faster, CSV outputs).
+
+---
+
+## 2) Units & timing
+
+* Internal units: **meters/seconds**.
+* **Δt = 0.1 s** (configurable 0.05–0.2).
+* “Game hours” via time scale (e.g., 1 real sec = 10 sim sec). Demand specified as **veh/hour**; spawners convert to arrivals per Δt.
+
+---
+
+## 3) Data model (core)
+
+```python
+# geometry.py
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+import numpy as np
+
+NodeId=int; LinkId=int; LaneId=int; VehId=int
+
+class LaneType: DRIVING=0; TURN_L=1; TURN_R=2; SHOULDER=3; BUS=4; TRUCK_PREF=5
+class ControlType: UNCTRL=0; STOP=1; YIELD=2; SIGNAL=3
+class VehClass: CAR=0; TRUCK=1
+
+@dataclass
+class Node:
+    id: NodeId
+    x: float; y: float
+    control: int = ControlType.UNCTRL
+    signal_id: Optional[int]=None
+    incoming: List[LaneId]=None
+    outgoing: List[LaneId]=None
+
+@dataclass
+class Link:
+    id: LinkId
+    a: NodeId; b: NodeId
+    length: float
+    speed_mps: float
+    lanes: List[LaneId]        # left→right
+    one_way: bool=False
+
+@dataclass
+class LaneConn:
+    to: LaneId
+    allow_car: bool=True
+    allow_truck: bool=True
+    is_turn: bool=False
+```
+
+**Vehicles (SoA for performance):**
+
+```python
+# state.py
+@dataclass
+class VehicleStore:
+    # Structure of Arrays
+    lane: np.ndarray     # LaneId
+    s:    np.ndarray     # position along lane (m)
+    v:    np.ndarray     # speed (m/s)
+    a:    np.ndarray     # accel (m/s^2)
+    klass:np.ndarray     # VehClass
+    length: np.ndarray
+    desire: np.ndarray   # desired speed
+    route_ix: np.ndarray # index into route list
+    # vector of lists for routes; or fixed-size ring buffer
+```
+
+**Demand:**
+
+```python
+# demand.py
+@dataclass
+class DemandSource:
+    link: LinkId
+    cars_per_hour: float
+    trucks_per_hour: float
+    headway: str="poisson"           # "poisson" | "deterministic"
+    time_windows: List[Tuple[str,str]]=[("06:00","10:00"), ("16:00","19:00")]
+    od_profile: Optional[dict]=None  # {sink_link_id: prob}
+
+@dataclass
+class DemandSink:
+    link: LinkId
+    absorb_prob: float=1.0
+```
+
+---
+
+## 4) Core algorithms
+
+### 4.1 Routing (`routing.py`)
+
+* Build a **lane-end graph**: nodes are lane terminals; edges are lane segments and legal turns (from `LaneConn`).
+* Base edge cost = `length / speed_limit`.
+* Dynamic penalties: queue length (seconds), red signal delay estimate on turn edges, truck penalties on steep turns.
+* Dijkstra/A\* with Euclidean heuristic (node coords).
+* Cache **source → sink** paths per demand source; refresh every **30 sim seconds** or when topology/control changes. Keep it deterministic by batching refreshes.
+
+### 4.2 Car-following (IDM) (`dynamics.py`)
+
+```
+a = a_max * [ 1 - (v / v0)^δ - ( (s* / gap)^2 ) ]
+s* = s0 + v*T + (v * Δv) / (2√(a_max * b))
+```
+
+Default params:
+
+* Car: `a_max=1.2 m/s²`, `b=2.0`, `T=1.2 s`, `s0=2 m`, `δ=4`
+* Truck: `a_max=0.6`, `b=2.0`, `T=1.6`, `s0=3 m`
+
+### 4.3 Lane change (MOBIL-lite)
+
+Change if:
+
+```
+Δa_self + p*(Δa_newFollower + Δa_oldFollower) > a_thr
+```
+
+* Politeness `p=0.2`, threshold `a_thr=0.1`, safety: resulting follower braking ≤ `b_safe` (3.0 cars / 2.0 trucks).
+* Disable discretionary changes within **100 m** of node if lane marking requires staying for turn.
+
+### 4.4 Intersections (`control.py`)
+
+* **Signals**: phases with protected movement sets. Yellow 3–5 s, all-red 1 s. Offset and cycle length configurable.
+* **Stop/Yield**: gap acceptance with critical headway; trucks require larger gaps.
+* **Priority merges**: mainline priority with metering option.
+
+### 4.5 Spawning & sinks (`demand.py`)
+
+* For each **DemandSource** at each Δt, arrivals are Binomial with `p = λ*Δt` where `λ = veh/hour/3600`.
+* Class split per source; choose route to a sink via cached paths (or choose sink by `od_profile` then route).
+* Spawn tries preferred entry lane; if blocked (no safety gap), enqueue in **source buffer** (not on map) and retry next tick.
+
+### 4.6 Update order (`scheduler.py`)
+
+1. Advance signals; compute allowed movements for this tick.
+2. Refresh a budgeted subset of routing caches.
+3. Spawn from sources into lanes if safe.
+4. Per lane (stable ordering):
+
+   * Identify leaders, compute IDM accelerations,
+   * Evaluate lane-change candidates, resolve conflicts (priority left→right, then RNG with fixed seed for ties),
+   * Commit lane changes.
+5. Integrate kinematics (semi-implicit Euler): clamp `v ≥ 0`, `v ≤ v_max`; update `s`.
+6. Traverse nodes at lane ends: if movement permitted & downstream gap ok, enter next lane; else stop at stopline (queue).
+7. Despawn at sinks; record metrics.
+8. Aggregate metrics (rolling windows).
+
+Determinism ensured by:
+
+* Fixed **Δt**,
+* Stable iteration orders,
+* Single seeded PRNG (`SplitMix64` in Python; or `numpy.random.Generator(PCG64)`).
+
+---
+
+## 5) UI (pygame) `ui/pygame_app.py`
+
+* **Canvas**: pan/zoom, 2D top-down.
+* **Tools**:
+
+  * Draw Road (click-drag polyline) → generates links & lanes (configurable lane count per direction, default 1).
+  * Lane tool: change lane count, lane type, turn lane length.
+  * Speed tool: set speed limit.
+  * Control tool: set Stop/Yield/Signal, edit phases with a simple matrix (movement × phase).
+  * Eraser/split/merge nodes.
+* **Demand panel**:
+
+  * Per-source: cars/hr, trucks/hr, % trucks, windows, OD dropdown (auto-populate exits).
+* **Overlays** (toggle keys):
+
+  * Speed heatmap, density/queue length, delay, signal states, per-movement volumes.
+* **Sim controls**: pause, step, ×0.5/×1/×2/×4 speed; record on/off (saves snapshots).
+* **Inspector**: click lane → show V/C, flow, avg speed; click node → show phase diagram.
+
+---
+
+## 6) Headless mode `scripts/run_scenario.py`
+
+CLI params:
+
+```
+python scripts/run_scenario.py --scenario scenarios/grid_4way.json \
+  --minutes 30 --seed 123 --csv out/metrics.csv
+```
+
+Outputs:
+
+* `metrics.csv` (per 1s or 10s): network throughput, avg delay, mean speed, total queued, per-lane flow.
+* Optional `trajectories.parquet` (sampled vehicles).
+
+---
+
+## 7) Persistence `persist.py`
+
+* Map JSON (nodes/links/lanes/turns, controls, sources/sinks).
+* Sim state save JSONL: signals’ timers, vehicles SoA arrays (compressed via `np.savez`), RNG state, rolling metric buffers.
+* **Record & replay**: snapshot hash every N ticks to assert determinism in tests.
+
+---
+
+## 8) Performance plan
+
+* SoA arrays; per-lane linked indices to keep vehicles ordered by `s` (avoid sorts).
+* Optional `numba` JIT for hot loops (IDM, MOBIL, integrate, leader search).
+* Partition lanes into worker chunks for **multithreaded** updates via `concurrent.futures` (GIL-safe if we push hot math into numba/numpy).
+* Target: **20k vehicles @ Δt=0.1 s** on a 4-core laptop with UI; **40k+ headless**.
+
+---
+
+## 9) Metrics & validation `metrics.py`
+
+* Per-lane: flow (veh/h), avg speed (m/s, km/h), density (veh/km), queue length (veh & m), avg delay (s/veh), green utilization.
+* Network: inflow/outflow, travel time dist. (probe vehicles), total delay.
+* **Sanity scenarios** (under `tests/`):
+
+  * Fundamental diagram on single link vs theoretical capacity.
+  * 4-leg intersection Webster delay estimate vs measured.
+  * Merge with trucks → shockwave speed within expected bounds.
+  * Determinism test: same seed → identical hash of state history.
+
+---
+
+## 10) Public API (core)
+
+```python
+from pysim_traffic.core.state import Simulation, SimConfig
+from pysim_traffic.core.geometry import Node, Link, LaneType, ControlType
+from pysim_traffic.core.metrics import NetworkStats, LaneStats
+
+sim = Simulation.from_map("scenarios/grid_4way.json", SimConfig(dt=0.1, seed=123))
+sim.step(ticks=600)     # 60s
+sim.add_demand_source(link_id=12, cars_per_hour=900, trucks_per_hour=60)
+stats: NetworkStats = sim.get_network_stats()
+lane_stats: LaneStats = sim.get_lane_stats(lane_id=5)
+sim.save_state("save/run1.state")
+```
+
+---
+
+## 11) Defaults & tuning
+
+* Speed limits: 30/50/80 km/h (urban/arterial/freeway).
+* Lane width: 3.5 m; default turn lane length: 50 m.
+* Trucks: length 14 m; desired speed 0.9× posted; `a_max=0.6`.
+* Signals: 90 s cycle, 4 s yellow, 1 s all-red.
+* Spawner retry cap: 2 attempts/tick, else defer (to avoid “teleport” jams).
+
+---
+
+## 12) Milestones (5 compact sprints)
+
+**S1 (2–3 days):** Geometry/topology + pygame road builder (draw roads, lanes, speed, stop/yield). JSON export, validation.
+
+**S2 (2–3 days):** Routing (Dijkstra + dynamic costs), spawners/sinks, single-link microsim with IDM. Headless run + CSV.
+
+**S3 (3–4 days):** Signals/phases, lane change (MOBIL), queueing & node traversal. UI overlays for queues and signal states.
+
+**S4 (2 days):** Metrics, demand editor, OD profiles, save/load, deterministic record/replay.
+
+**S5 (2–3 days):** Performance pass (numba), tests, docs, scenario library (grid, merge, arterial corridor).
+
+---
+
+## 13) Starter constants (drop-in)
+
+```python
+IDM = dict(a_max_car=1.2, a_max_truck=0.6, b=2.0, T_car=1.2, T_truck=1.6, s0_car=2.0, s0_truck=3.0, delta=4)
+MOBIL = dict(p=0.2, a_thr=0.1, b_safe_car=3.0, b_safe_truck=2.0, no_change_zone=100.0)
+SIGNAL_DEFAULTS = dict(cycle=90.0, yellow=4.0, all_red=1.0)
+SPAWN = dict(max_attempts_per_tick=2)
+```
+
+---
+
+## 14) Nice-to-haves (post-MVP)
+
+* Bus-only lanes & signal priority.
+* Incidents (blocked lane) and rerouting response.
+* Emissions estimates (speed/accel bins).
+* Batch optimizer: search signal timings to minimize total delay.
