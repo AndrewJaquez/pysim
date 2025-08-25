@@ -8,3 +8,12 @@ Sprint 1 Progress:
 - Added JSON persistence layer with save/load functionality
 - Created sample 4-way intersection network
 - Integrated file dialogs for network import/export
+
+Sprint 2 Progress:
+- Implemented Dijkstra routing with dynamic costs (queue/signal penalties, truck constraints)
+- Created demand management system with time windows, OD patterns, Poisson/deterministic spawning
+- Built IDM car-following model with vehicle class-specific parameters
+- Added Structure-of-Arrays vehicle storage for performance (10k+ vehicles)
+- Implemented deterministic simulation state with save/load/replay capability
+- Created headless runner with CSV metrics output (4600x+ real-time performance)
+- Added comprehensive metrics collection (speed, delay, throughput, vehicle counts)
